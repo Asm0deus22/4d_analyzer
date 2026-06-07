@@ -1,0 +1,4 @@
+1. DOT. ID_0. [X,Y,Z] DOUBLE
+2. LINE. ID_1. [X,Y,Z]+[X,Y,Z] DOUBLE
+3. TRIANGLE. ID_2. [X,Y,Z]+[X,Y,Z]+[X,Y,Z] DOUBLE
+4. CUBE. ID_3. [X,Y,Z]+[X,Y,Z] DOUBLE

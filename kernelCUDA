@@ -1,0 +1,341 @@
+struct __align__(16) Particle {
+    double x, y, z;
+    double lifetime;
+    unsigned long long colors; // RGBa + RGBa
+    double lastTicked;
+    double spawnedTime;
+    double squaredDistanceToCamera;
+    int screenX, screenY;
+    
+	long long _padding;
+};
+struct __align__(16) CameraParams {
+    double positionX;
+    double positionY;
+    double positionZ;
+    double directionX;
+    double directionY;
+    double directionZ;
+    double upX;
+    double upY;
+    double upZ;
+	double rightX;
+    double rightY;
+    double rightZ;
+    double screenDistance;
+    long long screenWidthPx;
+    long long screenHeightPx;
+    double fovHorizontal;
+};
+struct __align__(16) Emitter {
+	int ID;
+	int _padding;
+	double X1;
+	double Y1;
+	double Z1;
+	double X2;
+	double Y2;
+	double Z2;
+	double X3;
+	double Y3;
+	double Z3;
+};
+
+__device__ unsigned int xorshift32(unsigned int &state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+__device__ unsigned int wang_hash(unsigned int seed) {
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+__device__ void offsetSystem(double &x, double &y, double &z, double t, double deltaTime) {
+    double offsetX = y - 0.5 * x;
+    double offsetY = sin(x);
+    double offsetZ = sin(t);
+	//double offsetX = 1 * y;
+	//double offsetY = 1 * z;
+	//double offsetZ = t * x;
+    
+    x += offsetX * deltaTime;
+    y += offsetY * deltaTime;
+    z += offsetZ * deltaTime;
+}
+
+__device__ double calculateDistanceSquared(double x1, double y1, double z1, double x2, double y2, double z2) {
+    double dx = x1 - x2;
+    double dy = y1 - y2;
+    double dz = z1 - z2;
+    return dx*dx + dy*dy + dz*dz;
+}
+
+__global__ void interpolateColors(double minDistance, double maxDistance, Particle* data, int numPoints, int* colors) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= numPoints) return;
+	
+	double offset = (sqrt(data[idx].squaredDistanceToCamera) - sqrt(minDistance)) / (sqrt(maxDistance) - sqrt(minDistance));
+	
+	unsigned int one = (unsigned int)(data[idx].colors >> 32);
+	unsigned int two = (unsigned int) data[idx].colors;
+	
+	unsigned char R = (unsigned char)(((one >> 24) & 0xFF) * (1 - offset) + ((two >> 24) & 0xFF) * offset);
+	unsigned char G = (unsigned char)(((one >> 16) & 0xFF) * (1 - offset) + ((two >> 16) & 0xFF) * offset);
+	unsigned char B = (unsigned char)(((one >> 8) & 0xFF) * (1 - offset) + ((two >> 8) & 0xFF) * offset);
+	unsigned char a = (unsigned char)((one & 0xFF) * (1 - offset) + (two & 0xFF) * offset);
+	
+	colors[idx] = (R << 24) | (G << 16) | (B << 8) | a;
+}
+
+__global__ void shiftSystem(double t, double currentTime, double deltaTime, CameraParams* camera, Particle* data, int numPoints) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= numPoints) return;
+	if (data[idx].lifetime + data[idx].spawnedTime <= currentTime) return;
+    
+    offsetSystem(data[idx].x,data[idx].y,data[idx].z, t, deltaTime);
+    
+    data[idx].squaredDistanceToCamera = calculateDistanceSquared(data[idx].x,data[idx].y,data[idx].z,camera[0].positionX,camera[0].positionY,camera[0].positionZ);
+}
+
+__global__ void tickEmitterSystem2(double currentTime, Particle* data, int numPoints, Emitter *emitters, int emittersCount) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= numPoints) return;
+	if (data[idx].lifetime + data[idx].spawnedTime > currentTime) return;
+    
+	unsigned int r = __float_as_int((float) currentTime) * idx;
+	
+	int selecting = xorshift32(r) % emittersCount;
+	
+	switch (emitters[selecting].ID) {
+		case 1: {
+			data[idx].x = emitters[selecting].X1;
+			data[idx].y = emitters[selecting].Y1;
+			data[idx].z = emitters[selecting].Z1;
+			data[idx].spawnedTime = currentTime;
+			return;
+		}
+		case 4: {
+			data[idx].x = emitters[selecting].X1 + (emitters[selecting].X2 - emitters[selecting].X1) * ((float)xorshift32(r) / (float)0xFFFFFFFF);
+			data[idx].y = emitters[selecting].Y1 + (emitters[selecting].Y2 - emitters[selecting].Y1) * ((float)xorshift32(r) / (float)0xFFFFFFFF);
+			data[idx].z = emitters[selecting].Z1 + (emitters[selecting].Z2 - emitters[selecting].Z1) * ((float)xorshift32(r) / (float)0xFFFFFFFF);
+			data[idx].spawnedTime = currentTime;
+			return;
+		}
+		default: {
+			return;
+		}
+	}
+}
+__global__ void tickEmitterSystem(double currentTime, Particle* data, int numPoints, Emitter *emitters, int emittersCount) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= numPoints) return;
+    if (data[idx].lifetime + data[idx].spawnedTime > currentTime) return;
+    
+    unsigned int seed = wang_hash(
+        (unsigned int)(idx * 2654435761u) ^ 
+        (unsigned int)__double_as_longlong(currentTime)
+    );
+    
+    unsigned int rng = seed;
+    
+    int selecting = xorshift32(rng) % emittersCount;
+    
+    switch (emitters[selecting].ID) {
+        case 1: {
+            data[idx].x = emitters[selecting].X1;
+            data[idx].y = emitters[selecting].Y1;
+            data[idx].z = emitters[selecting].Z1;
+            data[idx].spawnedTime = currentTime;
+            return;
+        }
+        case 4: {
+            float rx = (float)xorshift32(rng) / (float)0xFFFFFFFF;
+            float ry = (float)xorshift32(rng) / (float)0xFFFFFFFF;
+            float rz = (float)xorshift32(rng) / (float)0xFFFFFFFF;
+            
+            data[idx].x = emitters[selecting].X1 + (emitters[selecting].X2 - emitters[selecting].X1) * rx;
+            data[idx].y = emitters[selecting].Y1 + (emitters[selecting].Y2 - emitters[selecting].Y1) * ry;
+            data[idx].z = emitters[selecting].Z1 + (emitters[selecting].Z2 - emitters[selecting].Z1) * rz;
+            data[idx].spawnedTime = currentTime;
+            return;
+        }
+        default: {
+            return;
+        }
+    }
+}
+
+__device__ double dotProduct(double x1, double y1, double z1, double x2, double y2, double z2) {
+    return x1*x2 + y1*y2 + z1*z2;
+}
+__device__ void cross_product(double &rx, double &ry, double &rz,
+                              double ax, double ay, double az,
+                              double bx, double by, double bz) {
+    rx = ay*bz - az*by;
+    ry = az*bx - ax*bz;
+    rz = ax*by - ay*bx;
+}
+__device__ double vectorLength(double x, double y, double z) {
+    return sqrt(x*x + y*y + z*z);
+}
+__device__ void normalize(double &x, double &y, double &z) {
+    double len = vectorLength(x, y, z);
+    if (len > 1e-10) {
+        x /= len;
+        y /= len;
+        z /= len;
+    }
+}
+
+__global__ void projectPoints(Particle* data, int numParticles, CameraParams* camera) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= numParticles) return;
+    
+    double cam_pos_x = camera->positionX;
+    double cam_pos_y = camera->positionY;
+    double cam_pos_z = camera->positionZ;
+    
+    double cam_dir_x = camera->directionX;
+    double cam_dir_y = camera->directionY;
+    double cam_dir_z = camera->directionZ;
+    
+    double cam_up_x = camera->upX;
+    double cam_up_y = camera->upY;
+    double cam_up_z = camera->upZ;
+    
+    double cam_right_x = camera->rightX;
+    double cam_right_y = camera->rightY;
+    double cam_right_z = camera->rightZ;
+    
+    double screen_dist = camera->screenDistance;
+    long screen_width_px = camera->screenWidthPx;
+    long screen_height_px = camera->screenHeightPx;
+    double fov_horizontal = camera->fovHorizontal;
+    
+    double dir_len = sqrt(cam_dir_x*cam_dir_x + cam_dir_y*cam_dir_y + cam_dir_z*cam_dir_z);
+    if (dir_len > 1e-10) {
+        cam_dir_x /= dir_len;
+        cam_dir_y /= dir_len;
+        cam_dir_z /= dir_len;
+    }
+    
+    normalize(cam_up_x, cam_up_y, cam_up_z);
+    
+    double right_x, right_y, right_z;
+    cross_product(right_x, right_y, right_z, cam_up_x, cam_up_y, cam_up_z, cam_dir_x, cam_dir_y, cam_dir_z);
+    
+    double right_len = vectorLength(right_x, right_y, right_z);
+    const double epsilon = 1e-6;
+    
+    if (right_len < epsilon) {
+        if (fabs(cam_up_x) > epsilon) {
+            right_x = cam_up_y;
+            right_y = -cam_up_x;
+            right_z = 0.0;
+        } else {
+            right_x = 0.0;
+            right_y = cam_up_z;
+            right_z = -cam_up_y;
+        }
+        right_len = vectorLength(right_x, right_y, right_z);
+    }
+    
+    if (right_len > epsilon) {
+        right_x /= right_len;
+        right_y /= right_len;
+        right_z /= right_len;
+    } else {
+        right_x = cam_right_x;
+        right_y = cam_right_y;
+        right_z = cam_right_z;
+        normalize(right_x, right_y, right_z);
+    }
+    
+    cross_product(cam_up_x, cam_up_y, cam_up_z, cam_dir_x, cam_dir_y, cam_dir_z, right_x, right_y, right_z);
+    normalize(cam_up_x, cam_up_y, cam_up_z);
+    
+    double vec_x = data[idx].x - cam_pos_x;
+    double vec_y = data[idx].y - cam_pos_y;
+    double vec_z = data[idx].z - cam_pos_z;
+    
+    double dot_dir = dotProduct(vec_x, vec_y, vec_z, cam_dir_x, cam_dir_y, cam_dir_z);
+    
+    if (dot_dir <= epsilon) {
+        data[idx].screenX = -1;
+        data[idx].screenY = -1;
+        return;
+    }
+    
+    double t = screen_dist / dot_dir;
+    
+    if (dot_dir > 1000.0) {
+        data[idx].screenX = -1;
+        data[idx].screenY = -1;
+        return;
+    }
+    
+    if (!isfinite(t)) {
+        data[idx].screenX = -1;
+        data[idx].screenY = -1;
+        return;
+    }
+    
+    double p_screen_x = cam_pos_x + t * vec_x;
+    double p_screen_y = cam_pos_y + t * vec_y;
+    double p_screen_z = cam_pos_z + t * vec_z;
+    
+    double screen_center_x = cam_pos_x + screen_dist * cam_dir_x;
+    double screen_center_y = cam_pos_y + screen_dist * cam_dir_y;
+    double screen_center_z = cam_pos_z + screen_dist * cam_dir_z;
+    
+    double screen_vec_x = p_screen_x - screen_center_x;
+    double screen_vec_y = p_screen_y - screen_center_y;
+    double screen_vec_z = p_screen_z - screen_center_z;
+    
+    double x_world = dotProduct(screen_vec_x, screen_vec_y, screen_vec_z, right_x, right_y, right_z);
+    double y_world = dotProduct(screen_vec_x, screen_vec_y, screen_vec_z, cam_up_x, cam_up_y, cam_up_z);
+    
+    double screen_width_world = 2.0 * screen_dist * tan(fov_horizontal / 2.0);
+    double screen_height_world = screen_width_world * (double)screen_height_px / (double)screen_width_px;
+    
+    if (fabs(x_world) > screen_width_world * 10.0 || fabs(y_world) > screen_height_world * 10.0) {
+        data[idx].screenX = -1;
+        data[idx].screenY = -1;
+        return;
+    }
+    
+    double x_norm = x_world / (screen_width_world / 2.0);
+    double y_norm = y_world / (screen_height_world / 2.0);
+    
+    if (fabs(screen_width_world) < epsilon) x_norm = 0.0;
+    if (fabs(screen_height_world) < epsilon) y_norm = 0.0;
+    
+    if (x_norm < -10.0) x_norm = -10.0;
+    if (x_norm > 10.0) x_norm = 10.0;
+    if (y_norm < -10.0) y_norm = -10.0;
+    if (y_norm > 10.0) y_norm = 10.0;
+    
+    double x_px = (x_norm + 1.0) * (screen_width_px / 2.0);
+    double y_px = (1.0 - y_norm) * (screen_height_px / 2.0);
+    
+    if (x_px < 0 || x_px >= screen_width_px || y_px < 0 || y_px >= screen_height_px) {
+        data[idx].screenX = -1;
+        data[idx].screenY = -1;
+        return;
+    }
+    
+    data[idx].screenX = (int)x_px;
+    data[idx].screenY = (int)y_px;
+}
